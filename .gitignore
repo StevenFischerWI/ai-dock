@@ -1,0 +1,15 @@
+bin/
+obj/
+node_modules/
+TestResults/
+*.user
+*.suo
+.vs/
+dist/
+src-tauri/target/
+src-tauri/target-*/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store

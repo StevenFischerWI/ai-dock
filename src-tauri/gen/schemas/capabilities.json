@@ -1,0 +1,1 @@
+{"default-capability":{"identifier":"default-capability","description":"Core permissions for the AI Dock windows","local":true,"windows":["dock","terminal-*","editor","rename","color","zenplan-editor","window-apps","launcher"],"permissions":["core:default","core:event:default","core:window:default","core:window:allow-start-dragging","core:window:allow-start-resize-dragging"]}}
