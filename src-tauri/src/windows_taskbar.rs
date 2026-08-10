@@ -1,10 +1,47 @@
 #[cfg(windows)]
 mod platform {
-    use std::ptr::null;
+    use std::{
+        mem::size_of,
+        ptr::null,
+        sync::atomic::{AtomicU32, Ordering},
+    };
 
     use anyhow::{Result, anyhow};
 
     type Hwnd = isize;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct AppBarData {
+        cb_size: u32,
+        hwnd: Hwnd,
+        callback_message: u32,
+        edge: u32,
+        rect: Rect,
+        lparam: isize,
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHAppBarMessage(message: u32, data: *mut AppBarData) -> usize;
+    }
+
+    const ABM_GETSTATE: u32 = 4;
+    const ABM_SETSTATE: u32 = 10;
+    const ABS_AUTOHIDE: u32 = 0x0000_0001;
+
+    /// Sentinel meaning nothing has been saved yet.
+    const NO_SAVED_STATE: u32 = u32::MAX;
+    static SAVED_STATE: AtomicU32 = AtomicU32::new(NO_SAVED_STATE);
 
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -28,10 +65,63 @@ mod platform {
             .any(|window| unsafe { IsWindowVisible(*window) } != 0)
     }
 
+    /// Reads the taskbar's autohide / always-on-top flags.
+    fn state() -> u32 {
+        let mut data = AppBarData {
+            cb_size: size_of::<AppBarData>() as u32,
+            ..AppBarData::default()
+        };
+        unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) as u32 }
+    }
+
+    fn set_state(state: u32) {
+        let mut data = AppBarData {
+            cb_size: size_of::<AppBarData>() as u32,
+            lparam: state as isize,
+            ..AppBarData::default()
+        };
+        unsafe {
+            SHAppBarMessage(ABM_SETSTATE, &mut data);
+        }
+    }
+
+    /// Releases or reinstates the screen space Explorer reserves for the taskbar.
+    ///
+    /// Hiding the taskbar window leaves its AppBar reservation registered, so Explorer
+    /// keeps clamping the work area to the bar it is no longer drawing and every
+    /// maximized window stops short of the screen edge. Auto-hide is the state that
+    /// actually surrenders the reservation, so collapse switches the taskbar into it
+    /// and expanding puts back whatever was in force beforehand.
+    fn set_space_reserved(reserved: bool) {
+        if reserved {
+            let saved = SAVED_STATE.swap(NO_SAVED_STATE, Ordering::AcqRel);
+            if saved != NO_SAVED_STATE {
+                set_state(saved);
+            }
+            return;
+        }
+
+        // Only the first collapse records a baseline; later ones would record the
+        // auto-hide state we just installed and lose the user's real preference.
+        let _ = SAVED_STATE.compare_exchange(
+            NO_SAVED_STATE,
+            state(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        set_state(ABS_AUTOHIDE);
+    }
+
     pub fn set_visible(visible: bool) -> Result<()> {
         let windows = taskbar_windows();
         if windows.is_empty() {
             return Err(anyhow!("Windows taskbar was not found"));
+        }
+
+        // Surrender the reservation before hiding, and reinstate it after showing, so
+        // the work area is never left describing a bar that is not on screen.
+        if !visible {
+            set_space_reserved(false);
         }
 
         let command = if visible { SW_SHOW } else { SW_HIDE };
@@ -45,6 +135,10 @@ mod platform {
             return Err(anyhow!(
                 "Windows could not update {failed} taskbar window(s)"
             ));
+        }
+
+        if visible {
+            set_space_reserved(true);
         }
         Ok(())
     }
