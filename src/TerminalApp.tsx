@@ -160,31 +160,46 @@ function TerminalPane({ session, active, onStatus }: TerminalPaneProps) {
     };
     const pendingOutput: Uint8Array[] = [];
     let pendingOutputBytes = 0;
+    let outputWriteInProgress = false;
+    // xterm parses writes synchronously on the WebView thread. Small slices keep
+    // tab clicks, Ctrl+H, painting, and dock heartbeats responsive while several
+    // tabs replay their persisted scrollback at the same time.
+    const outputBatchBytes = 16 * 1024;
     const flushOutput = () => {
       outputTimer = undefined;
-      if (disposed || pendingOutputBytes === 0) return;
-      let output: Uint8Array;
-      if (pendingOutput.length === 1) {
-        output = pendingOutput[0];
-      } else {
-        output = new Uint8Array(pendingOutputBytes);
-        let offset = 0;
-        for (const chunk of pendingOutput) {
-          output.set(chunk, offset);
-          offset += chunk.length;
+      if (disposed || outputWriteInProgress || pendingOutputBytes === 0) return;
+
+      const batchBytes = Math.min(pendingOutputBytes, outputBatchBytes);
+      const output = new Uint8Array(batchBytes);
+      let offset = 0;
+      while (offset < batchBytes) {
+        const chunk = pendingOutput[0];
+        const take = Math.min(chunk.length, batchBytes - offset);
+        output.set(chunk.subarray(0, take), offset);
+        offset += take;
+        if (take === chunk.length) {
+          pendingOutput.shift();
+        } else {
+          pendingOutput[0] = chunk.subarray(take);
         }
       }
-      pendingOutput.length = 0;
-      pendingOutputBytes = 0;
-      entry.terminal.write(output);
+      pendingOutputBytes -= batchBytes;
+      outputWriteInProgress = true;
+      entry.terminal.write(output, () => {
+        outputWriteInProgress = false;
+        if (!disposed && pendingOutputBytes > 0 && outputTimer === undefined) {
+          // Let the WebView paint and service input between large scrollback batches.
+          outputTimer = window.setTimeout(flushOutput, 0);
+        }
+      });
     };
     const queueOutput = (encoded: string) => {
       const chunk = decodeBase64(encoded);
       pendingOutput.push(chunk);
       pendingOutputBytes += chunk.length;
-      if (pendingOutputBytes >= 256 * 1024) {
+      if (pendingOutputBytes >= outputBatchBytes && !outputWriteInProgress) {
         window.clearTimeout(outputTimer);
-        flushOutput();
+        outputTimer = window.setTimeout(flushOutput, 0);
       } else if (outputTimer === undefined) {
         outputTimer = window.setTimeout(flushOutput, 4);
       }

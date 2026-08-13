@@ -9,6 +9,7 @@ import type {
 } from './types';
 
 export const api = {
+  uiHeartbeat: () => invoke<void>('ui_heartbeat'),
   getSettings: () => invoke<AppSettings>('get_settings'),
   getVisibleGroups: () => invoke<string[]>('get_visible_groups'),
   getVisibleZenPlanNotebooks: () => invoke<string[]>('get_visible_zenplan_notebooks'),
@@ -36,6 +37,7 @@ export const api = {
   isWindowsTaskbarVisible: () => invoke<boolean>('is_windows_taskbar_visible'),
   toggleWindowsTaskbar: () => invoke<boolean>('toggle_windows_taskbar'),
   activateGroup: (groupId: string) => invoke<void>('activate_group', { groupId }),
+  toggleAllTerminals: () => invoke<boolean>('toggle_all_terminals'),
   startSession: (sessionId: string, cols: number, rows: number) =>
     invoke<void>('start_session', { sessionId, cols, rows }),
   hideTerminal: (groupId?: string) => invoke<void>('hide_terminal', { groupId: groupId ?? null }),

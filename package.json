@@ -13,6 +13,7 @@
     "desktop:dev": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/with-msvc.ps1 dev",
     "desktop:dev:isolated": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/with-msvc.ps1 dev-isolated",
     "desktop:build": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/with-msvc.ps1 build",
+    "desktop:build:cutover": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/with-msvc.ps1 build-cutover",
     "desktop:build:isolated": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/with-msvc.ps1 build-isolated",
     "desktop:test": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/with-msvc.ps1 test"
   },

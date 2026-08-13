@@ -46,7 +46,6 @@ mod platform {
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const DWMWA_CLOAKED: u32 = 14;
     const SW_SHOW: i32 = 5;
-    const SW_MINIMIZE: i32 = 6;
     const SW_RESTORE: i32 = 9;
     const WM_GETICON: u32 = 0x007f;
     const WM_CLOSE: u32 = 0x0010;
@@ -65,6 +64,14 @@ mod platform {
     const ICON_SIZE: usize = 32;
 
     static ICON_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+
+    // Mark intentionally hidden third-party windows on the HWND itself. Unlike
+    // process memory, this survives an AI Dock UI recovery, so a hidden app's
+    // icon remains available after the dock restarts.
+    const HIDDEN_WINDOW_PROPERTY: [u16; 25] = [
+        65, 73, 95, 68, 79, 67, 75, 95, 73, 78, 83, 84, 65, 78, 84, 76, 89, 95, 72, 73, 68, 68, 69,
+        78, 0,
+    ];
 
     #[repr(C)]
     struct BitmapInfoHeader {
@@ -109,10 +116,13 @@ mod platform {
         fn GetWindowTextLengthW(hwnd: Hwnd) -> i32;
         fn GetWindowTextW(hwnd: Hwnd, title: *mut u16, max_count: i32) -> i32;
         fn GetWindowThreadProcessId(hwnd: Hwnd, process_id: *mut u32) -> u32;
+        fn GetPropW(hwnd: Hwnd, name: *const u16) -> Handle;
         fn IsIconic(hwnd: Hwnd) -> i32;
         fn IsWindow(hwnd: Hwnd) -> i32;
         fn IsWindowVisible(hwnd: Hwnd) -> i32;
         fn PostMessageW(hwnd: Hwnd, message: u32, wparam: usize, lparam: isize) -> i32;
+        fn RemovePropW(hwnd: Hwnd, name: *const u16) -> Handle;
+        fn SetPropW(hwnd: Hwnd, name: *const u16, value: Handle) -> i32;
         fn keybd_event(virtual_key: u8, scan_code: u8, flags: u32, extra_info: usize);
         fn DrawIconEx(
             hdc: Hwnd,
@@ -214,14 +224,19 @@ mod platform {
         let Some(windows) = (data as *mut Vec<ActiveWindowApp>).as_mut() else {
             return 0;
         };
-        if let Some(window) = window_info(hwnd) {
+        let intentionally_hidden = is_intentionally_hidden(hwnd);
+        if let Some(window) = window_info(hwnd, intentionally_hidden) {
             windows.push(window);
         }
         1
     }
 
-    unsafe fn window_info(hwnd: Hwnd) -> Option<ActiveWindowApp> {
-        if IsWindowVisible(hwnd) == 0 || is_cloaked(hwnd) {
+    unsafe fn is_intentionally_hidden(hwnd: Hwnd) -> bool {
+        GetPropW(hwnd, HIDDEN_WINDOW_PROPERTY.as_ptr()) != 0
+    }
+
+    unsafe fn window_info(hwnd: Hwnd, intentionally_hidden: bool) -> Option<ActiveWindowApp> {
+        if (!intentionally_hidden && IsWindowVisible(hwnd) == 0) || is_cloaked(hwnd) {
             return None;
         }
         let class_name = read_class_name(hwnd);
@@ -264,7 +279,9 @@ mod platform {
             title,
             icon_data_url,
             is_focused: GetForegroundWindow() == hwnd,
-            is_minimized: IsIconic(hwnd) != 0,
+            // Reuse the minimized presentation for windows hidden by AI Dock.
+            // Unlike real minimization, SW_HIDE/SW_SHOW has no shell animation.
+            is_minimized: intentionally_hidden || IsIconic(hwnd) != 0,
             process_id,
             executable_path,
         })
@@ -473,10 +490,28 @@ mod platform {
         if hwnd == 0 || unsafe { IsWindow(hwnd) } == 0 {
             anyhow::bail!("That window is no longer open");
         }
-        let should_minimize = was_focused || unsafe { GetForegroundWindow() } == hwnd;
-        if should_minimize {
+        let was_hidden = unsafe { RemovePropW(hwnd, HIDDEN_WINDOW_PROPERTY.as_ptr()) != 0 };
+        if was_hidden {
             unsafe {
-                ShowWindow(hwnd, SW_MINIMIZE);
+                ShowWindow(
+                    hwnd,
+                    if IsIconic(hwnd) != 0 {
+                        SW_RESTORE
+                    } else {
+                        SW_SHOW
+                    },
+                );
+            }
+            focus_hwnd(hwnd)?;
+            return Ok(true);
+        }
+        let should_hide = was_focused || unsafe { GetForegroundWindow() } == hwnd;
+        if should_hide {
+            unsafe {
+                if SetPropW(hwnd, HIDDEN_WINDOW_PROPERTY.as_ptr(), 1) == 0 {
+                    anyhow::bail!("Windows could not mark that app as hidden");
+                }
+                ShowWindow(hwnd, 0); // SW_HIDE is immediate and avoids shell animations.
             }
             return Ok(false);
         }
@@ -500,6 +535,7 @@ mod platform {
             anyhow::bail!("That window is no longer open");
         }
         unsafe {
+            RemovePropW(hwnd, HIDDEN_WINDOW_PROPERTY.as_ptr());
             ShowWindow(
                 hwnd,
                 if IsIconic(hwnd) != 0 {
@@ -523,6 +559,9 @@ mod platform {
         }
         if process_id == 0 || process_id == unsafe { GetCurrentProcessId() } {
             anyhow::bail!("AI Dock cannot close that window");
+        }
+        unsafe {
+            RemovePropW(hwnd, HIDDEN_WINDOW_PROPERTY.as_ptr());
         }
         if unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) } == 0 {
             anyhow::bail!("Windows could not send the close request");

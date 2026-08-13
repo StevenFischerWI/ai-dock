@@ -12,7 +12,7 @@ import type {
   AppSettings,
   SessionState,
   SessionStatePayload,
-  TerminalOutputPayload,
+  TerminalActivityPayload,
   TerminalVisibilityPayload,
   ZenPlanVisibilityPayload
 } from './types';
@@ -228,7 +228,7 @@ export function DockApp() {
         await listen<SessionStatePayload>('session-state', (event) => {
           setStates((current) => ({ ...current, [event.payload.sessionId]: event.payload.state }));
         }),
-        await listen<TerminalOutputPayload>('terminal-output', (event) => {
+        await listen<TerminalActivityPayload>('terminal-activity', (event) => {
           setStates((current) => {
             const session = settingsRef.current?.sessions.find(
               (candidate) => candidate.id === event.payload.sessionId
@@ -418,6 +418,22 @@ export function DockApp() {
         >
           <span className="brand-mark">AI</span>
           <span className="brand-name">{isTestBuild ? 'Dock Test' : 'Dock'}</span>
+        </button>
+
+        <button
+          className={`terminal-visibility-button ${visibleGroups.size > 0 ? 'is-active' : ''}`}
+          aria-label={visibleGroups.size > 0
+            ? 'Hide all terminal windows'
+            : 'Show all terminal windows'}
+          aria-pressed={visibleGroups.size > 0}
+          onClick={() => runUiAction(
+            visibleGroups.size > 0
+              ? 'Could not hide all terminal windows'
+              : 'Could not show all terminal windows',
+            api.toggleAllTerminals
+          )}
+        >
+          <span className="terminal-stack-glyph" aria-hidden="true" />
         </button>
 
         <div className="dock-tabs" role="tablist" aria-label="Terminal windows">

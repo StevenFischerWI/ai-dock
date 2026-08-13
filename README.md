@@ -10,10 +10,14 @@ AI Dock is a Windows bottom-edge dock for persistent terminal windows. Each wind
 - Places the dock `+` immediately after the final window and provides another `+` inside each window. Both create and open a PowerShell terminal immediately; the in-window version adds it to that window's group.
 - Keeps only the dock always on top; terminal and editor windows layer like ordinary desktop windows.
 - Lets you drag the terminal and session editor by their slim title strips, and resize them from their lower-right grips. The terminal remembers its size and position across hide/show.
-- Click a dock item to restore it when minimized, focus it when visible but behind another window, or minimize it when it is already focused. Other visible windows stay open and keep running, and every terminal tab in the group follows the window.
+- Click a dock item to show it when hidden, focus it when visible but behind another window, or hide it instantly when it is already focused. Other visible windows stay open and keep running, and every terminal tab in the group follows the window. Press `Ctrl+H` in a terminal or pinned web app to hide its current window; press it again within 10 seconds to undo unless you focus another window first. Use the stacked-window button left of the terminal groups to show/hide all terminal windows together.
 - Each terminal window has a `−` control that instantly hides it to the dock without stopping its processes. The `×` control asks whether to save the complete window configuration to **Recently closed**, forget it permanently, or cancel. Closing stops all terminal processes and removes the item from the dock.
 - Terminal and editor windows disable native transition animations for immediate show/hide behavior.
 - Runs interactive terminal applications through ConPTY and renders them with xterm.js.
+- Owns every ConPTY and CLI process in a detached `ai-dock-session-host.exe`, outside the Tauri/WebView UI process. If the dock UI hangs, crashes, or is force-restarted during an update, terminals continue running and reconnect when their window is opened again.
+- Keeps a bounded 8 MiB in-memory output replay per terminal. A restarted UI receives the retained scrollback, while sequenced chunks prevent an ordinary IPC reconnect from duplicating output already on screen. Slow or hung UI subscribers are dropped without ever blocking terminal output.
+- Uses authenticated localhost IPC and a persistent low-latency control connection for keyboard input, paste, resize, and lifecycle commands. Clicking **Exit AI Dock** deliberately shuts down the detached host and all sessions; killing only the UI does not.
+- Runs two lightweight watchdogs outside the WebView pages. A native message-loop stall or a missing dock/visible-terminal heartbeat launches an independent recovery helper, terminates only the wedged Tauri UI, and starts a clean UI process. Detached sessions remain alive and reconnect after the restart. Incidents are recorded in `%APPDATA%\com.aidock.desktop\watchdog.log`.
 - Uses the native Windows clipboard for immediate terminal copy/paste; large pastes go through xterm as one bracketed-paste operation. Browser clipboard handling remains as the cross-platform fallback.
 - Runs the installed Claude Code and Codex CLIs directly through the same ConPTY terminal path as other interactive programs.
 - Creates CLI windows from **AI Dock → New Claude CLI…** and **AI Dock → New Codex CLI…**. Existing `+` buttons retain their fast PowerShell behavior.
@@ -23,7 +27,7 @@ AI Dock is a Windows bottom-edge dock for persistent terminal windows. Each wind
 - Persists settings in `%APPDATA%\com.aidock.desktop\settings.json` without storing terminal output.
 - Re-registers the dock after Explorer/taskbar, display, and DPI changes.
 - Prevents multiple dock instances.
-- Shows other taskbar-style Windows apps as compact native app icons in a centered strip between the primary terminal groups and the right-side utilities. Window titles remain available as hover tooltips. Click an app to focus or restore it; click it again while focused to minimize it. Right-clicking offers only **Close window** and **Don't show in dock**. **AI Dock → Apps shown in dock…** opens a persistent checklist, so hidden apps can be restored and any number of apps can be checked or unchecked before closing it.
+- Shows other taskbar-style Windows apps as compact native app icons in a centered strip between the primary terminal groups and the right-side utilities. Window titles remain available as hover tooltips. Click an app to focus or show it; click it again while focused to hide it instantly without a minimize/restore animation. Right-clicking offers only **Close window** and **Don't show in dock**. **AI Dock → Apps shown in dock…** opens a persistent checklist, so hidden apps can be restored and any number of apps can be checked or unchecked before closing it.
 - Tracks newly observed Windows app processes in **AI Dock → Recent apps**. Selecting an app focuses its existing window or relaunches its recorded executable; apps unchecked in **Apps shown in dock…** stay out of this launcher.
 - Batches high-volume terminal output into small four-millisecond windows, coalesces resize work to one fit per display frame, and avoids dock re-renders when the Windows app snapshot has not changed.
 - Supports multiple named **web app** pins on the right side. AI Dock discovers and caches each site's favicon, with the app-name initial as a fallback. Every pin has its own `http://` or `https://` URL, resizable WebView2 window, and remembered geometry; new web app windows tile right-to-left above the dock. Use **AI Dock → Pin web app…**, and right-click a pin to edit or unpin it.
@@ -35,7 +39,10 @@ The compiled application is:
 
 ```text
 src-tauri\target\release\ai-dock.exe
+src-tauri\target\release\ai-dock-session-host.exe
 ```
+
+Keep both executables together. AI Dock stages a uniquely named copy of the session host under its AppData directory before launching it, so the release files can be replaced during an update while live sessions remain attached to the older host process.
 
 Double-click it, or run:
 
@@ -84,7 +91,10 @@ For hot-reload development, use `npm run desktop:dev:isolated`. This flavor has 
 
 - `src/` — React dock, session editor, and xterm terminal surface.
 - `src-tauri/src/appbar.rs` — Windows AppBar registration and recovery.
-- `src-tauri/src/session.rs` — portable PTY ownership, input/output, resize, restart, and stop.
+- `src-tauri/src/session.rs` — reconnecting UI-side client, PowerShell history setup, and host lifecycle.
+- `src-tauri/src/session_host.rs` — detached ConPTY/process ownership, bounded replay, and nonblocking subscriber fan-out.
+- `src-tauri/src/session_protocol.rs` — authenticated localhost IPC request, response, and event types.
+- `src-tauri/src/watchdog.rs` — independent Windows UI-message-loop health logging.
 - `src-tauri/src/settings.rs` — atomic versioned settings storage.
 - `src-tauri/src/windowing.rs` — monitor-aware popup sizing and placement.
 - `src-tauri/src/windows_apps.rs` — taskbar-style top-level window discovery and activation.
@@ -94,7 +104,7 @@ The PTY manager and UI model are cross-platform. A future macOS build needs a na
 ## Current MVP boundaries
 
 - The dock uses the monitor on which it starts; there is not yet a monitor picker.
-- Running shells survive hide/show, but intentionally stop when AI Dock exits or the computer restarts.
+- Running shells survive hide/show and an AI Dock UI crash or force-restart. They intentionally stop on **Exit AI Dock** or a computer restart; after a reboot, the saved tab definition and CLI history remain, but the old OS processes cannot be reattached.
 - Recently closed windows restore their tab configuration, commands, folders, colors, and geometry; terminal output and stopped processes are not retained.
 - AI Dock creates and owns sessions; it does not adopt arbitrary already-open Windows Terminal tabs.
 - Launch-at-login, global hotkeys, installer packaging, and automatic updates are follow-up work.

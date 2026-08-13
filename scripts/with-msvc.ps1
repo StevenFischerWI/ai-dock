@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('check', 'clippy', 'dev', 'build', 'test', 'dev-isolated', 'build-isolated')]
+    [ValidateSet('check', 'clippy', 'dev', 'build', 'build-cutover', 'test', 'dev-isolated', 'build-isolated', 'host-build-isolated')]
     [string]$Action
 )
 
@@ -61,19 +61,48 @@ switch ($Action) {
     'check' { & cargo check --manifest-path $manifest }
     'clippy' { & cargo clippy --manifest-path $manifest --all-targets -- -D warnings }
     'test' { & cargo test --manifest-path $manifest }
-    'dev' { & "$projectRoot\node_modules\.bin\tauri.cmd" dev }
-    'build' { & "$projectRoot\node_modules\.bin\tauri.cmd" build }
+    'dev' {
+        & cargo build --manifest-path $manifest --bin ai-dock-session-host
+        if ($LASTEXITCODE -eq 0) {
+            & "$projectRoot\node_modules\.bin\tauri.cmd" dev
+        }
+    }
+    'build' {
+        & "$projectRoot\node_modules\.bin\tauri.cmd" build
+        if ($LASTEXITCODE -eq 0) {
+            & cargo build --release --manifest-path $manifest --bin ai-dock-session-host
+        }
+    }
+    'build-cutover' {
+        $env:CARGO_TARGET_DIR = Join-Path $projectRoot 'src-tauri\target-cutover'
+        & "$projectRoot\node_modules\.bin\tauri.cmd" build
+        if ($LASTEXITCODE -eq 0) {
+            & cargo build --release --manifest-path $manifest --bin ai-dock-session-host
+        }
+    }
     'dev-isolated' {
         $env:AI_DOCK_BUILD_FLAVOR = 'test'
         $env:VITE_AI_DOCK_FLAVOR = 'test'
         $env:CARGO_TARGET_DIR = Join-Path $projectRoot 'src-tauri\target-isolated'
-        & "$projectRoot\node_modules\.bin\tauri.cmd" dev --config $isolatedConfig
+        & cargo build --manifest-path $manifest --bin ai-dock-session-host
+        if ($LASTEXITCODE -eq 0) {
+            & "$projectRoot\node_modules\.bin\tauri.cmd" dev --config $isolatedConfig
+        }
     }
     'build-isolated' {
         $env:AI_DOCK_BUILD_FLAVOR = 'test'
         $env:VITE_AI_DOCK_FLAVOR = 'test'
         $env:CARGO_TARGET_DIR = Join-Path $projectRoot 'src-tauri\target-isolated'
         & "$projectRoot\node_modules\.bin\tauri.cmd" build --config $isolatedConfig
+        if ($LASTEXITCODE -eq 0) {
+            & cargo build --release --manifest-path $manifest --bin ai-dock-session-host
+        }
+    }
+    'host-build-isolated' {
+        $env:AI_DOCK_BUILD_FLAVOR = 'test'
+        $env:VITE_AI_DOCK_FLAVOR = 'test'
+        $env:CARGO_TARGET_DIR = Join-Path $projectRoot 'src-tauri\target-isolated'
+        & cargo build --release --manifest-path $manifest --bin ai-dock-session-host
     }
 }
 

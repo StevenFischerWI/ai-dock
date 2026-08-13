@@ -38,6 +38,200 @@ pub fn disable_window_animations(_window: &WebviewWindow) -> Result<()> {
 }
 
 #[cfg(windows)]
+pub fn install_ctrl_h_handler<FHide, FRestore>(
+    window: &WebviewWindow,
+    on_hide: FHide,
+    on_restore: FRestore,
+) -> Result<()>
+where
+    FHide: Fn() + Send + Sync + 'static,
+    FRestore: Fn() + Send + Sync + 'static,
+{
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+    use webview2_com::{
+        AcceleratorKeyPressedEventHandler,
+        Microsoft::Web::WebView2::Win32::COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+    };
+    use windows_sys::Win32::{
+        Foundation::HWND,
+        UI::{
+            Input::KeyboardAndMouse::{
+                MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+            },
+            WindowsAndMessaging::{GetForegroundWindow, MSG, PM_REMOVE, PeekMessageW, WM_HOTKEY},
+        },
+    };
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetKeyState(virtual_key: i32) -> i16;
+        fn ShowWindow(hwnd: isize, command: i32) -> i32;
+    }
+
+    const VK_CONTROL: i32 = 0x11;
+    const VK_H: u32 = 0x48;
+    const SW_HIDE: i32 = 0;
+    const SW_SHOW: i32 = 5;
+    const CTRL_H_HOTKEY_ID: i32 = 0x41D0;
+    const UNDO_DURATION: Duration = Duration::from_secs(10);
+    const HOTKEY_REGISTRATION_DELAY: Duration = Duration::from_millis(60);
+    const FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    static CTRL_H_UNDO_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    fn arm_restore(window: WebviewWindow, hwnd: isize, on_restore: Arc<dyn Fn() + Send + Sync>) {
+        let generation = CTRL_H_UNDO_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = thread::Builder::new()
+            .name("ai-dock-ctrl-h-undo".to_string())
+            .spawn(move || {
+                // Let the first keypress finish before registering the same chord
+                // globally; otherwise the still-held H key can look like an undo.
+                thread::sleep(HOTKEY_REGISTRATION_DELAY);
+                if CTRL_H_UNDO_GENERATION.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+
+                let registered = unsafe {
+                    RegisterHotKey(
+                        std::ptr::null_mut(),
+                        CTRL_H_HOTKEY_ID,
+                        MOD_CONTROL | MOD_NOREPEAT,
+                        VK_H,
+                    ) != 0
+                };
+                if !registered {
+                    eprintln!("AI Dock could not arm the Ctrl+H undo shortcut");
+                    return;
+                }
+
+                let started = Instant::now();
+                let mut fallback_foreground: HWND = std::ptr::null_mut();
+                let mut message = MSG::default();
+                loop {
+                    if CTRL_H_UNDO_GENERATION.load(Ordering::SeqCst) != generation
+                        || started.elapsed() >= UNDO_DURATION
+                    {
+                        break;
+                    }
+
+                    let has_hotkey = unsafe {
+                        PeekMessageW(
+                            &mut message,
+                            std::ptr::null_mut(),
+                            WM_HOTKEY,
+                            WM_HOTKEY,
+                            PM_REMOVE,
+                        ) != 0
+                    };
+                    if has_hotkey && message.wParam == CTRL_H_HOTKEY_ID as usize {
+                        // Show natively first for an immediate undo, then synchronize
+                        // Tauri and the dock's visibility indicator.
+                        unsafe {
+                            ShowWindow(hwnd, SW_SHOW);
+                        }
+                        if let Err(error) = window.show() {
+                            eprintln!("AI Dock could not synchronize Ctrl+H restore: {error}");
+                        }
+                        if let Err(error) = focus_window(&window) {
+                            eprintln!(
+                                "AI Dock could not focus the Ctrl+H restored window: {error:#}"
+                            );
+                        }
+                        on_restore();
+                        break;
+                    }
+
+                    let foreground = unsafe { GetForegroundWindow() };
+                    if foreground != hwnd as HWND && !foreground.is_null() {
+                        if fallback_foreground.is_null() {
+                            // Windows automatically focuses the window underneath the
+                            // one just hidden. That initial transfer is not a user action.
+                            fallback_foreground = foreground;
+                        } else if foreground != fallback_foreground {
+                            // A subsequent focus change means the user moved on, so Ctrl+H
+                            // belongs to the newly focused application again.
+                            break;
+                        }
+                    }
+                    thread::sleep(FOCUS_POLL_INTERVAL);
+                }
+
+                unsafe {
+                    UnregisterHotKey(std::ptr::null_mut(), CTRL_H_HOTKEY_ID);
+                }
+            });
+    }
+
+    let hwnd = window.hwnd().context("getting Ctrl+H window HWND")?.0 as isize;
+    let tauri_window = window.clone();
+    let on_hide: Arc<dyn Fn() + Send + Sync> = Arc::new(on_hide);
+    let on_restore: Arc<dyn Fn() + Send + Sync> = Arc::new(on_restore);
+    window
+        .with_webview(move |webview| {
+            let controller = webview.controller();
+            let mut token = 0_i64;
+            let result = unsafe {
+                controller.add_AcceleratorKeyPressed(
+                    &AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
+                        let Some(args) = args else {
+                            return Ok(());
+                        };
+                        let mut event_kind = Default::default();
+                        let mut virtual_key = 0_u32;
+                        args.KeyEventKind(&mut event_kind)?;
+                        args.VirtualKey(&mut virtual_key)?;
+                        if event_kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                            && virtual_key == VK_H
+                            && GetKeyState(VK_CONTROL) < 0
+                        {
+                            args.SetHandled(true)?;
+                            // Hide natively inside the accelerator callback so the shortcut
+                            // remains instant even while the Tauri event loop is busy. Follow
+                            // it with Tauri's hide operation so its visibility state stays in
+                            // sync and the next dock click restores the window.
+                            ShowWindow(hwnd, SW_HIDE);
+                            if let Err(error) = tauri_window.hide() {
+                                eprintln!(
+                                    "AI Dock could not synchronize Ctrl+H visibility: {error}"
+                                );
+                            }
+                            on_hide();
+                            arm_restore(tauri_window.clone(), hwnd, Arc::clone(&on_restore));
+                        }
+                        Ok(())
+                    })),
+                    &mut token,
+                )
+            };
+            if let Err(error) = result {
+                eprintln!("AI Dock could not install Ctrl+H: {error}");
+            }
+        })
+        .context("installing Ctrl+H handler")?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn install_ctrl_h_handler<FHide, FRestore>(
+    _window: &WebviewWindow,
+    _on_hide: FHide,
+    _on_restore: FRestore,
+) -> Result<()>
+where
+    FHide: Fn() + Send + Sync + 'static,
+    FRestore: Fn() + Send + Sync + 'static,
+{
+    Ok(())
+}
+
+#[cfg(windows)]
 pub fn focus_window(window: &WebviewWindow) -> Result<()> {
     #[link(name = "kernel32")]
     unsafe extern "system" {

@@ -3,15 +3,25 @@ mod clipboard;
 mod favicons;
 mod models;
 mod session;
+mod session_host;
+mod session_protocol;
 mod settings;
+mod watchdog;
 mod windowing;
 mod windows_apps;
 mod windows_taskbar;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    fs::{self, OpenOptions},
+    io::Write,
     path::PathBuf,
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Context;
@@ -39,6 +49,9 @@ pub struct AppState {
     launcher_focus_loss: Mutex<Option<Instant>>,
     launcher_opened_at: Mutex<Option<Instant>>,
     observed_window_app_instances: Mutex<HashSet<(String, u32)>>,
+    ui_heartbeats: Arc<Mutex<HashMap<String, Instant>>>,
+    monitored_webviews: Arc<Mutex<HashSet<String>>>,
+    ui_restart_requested: Arc<AtomicBool>,
 }
 
 fn is_test_build() -> bool {
@@ -52,10 +65,13 @@ impl AppState {
         if first_run && let Err(error) = settings::save(&settings_path, &loaded_settings) {
             eprintln!("AI Dock could not save first-run settings: {error:#}");
         }
+        let session_config_dir = settings_path
+            .parent()
+            .map_or_else(|| std::env::temp_dir().join("AiDock"), PathBuf::from);
         Self {
             settings: Mutex::new(loaded_settings),
             settings_path,
-            sessions: SessionManager::default(),
+            sessions: SessionManager::new(session_config_dir),
             editor_target: Mutex::new((None, None)),
             rename_target: Mutex::new(None),
             color_target: Mutex::new(None),
@@ -66,6 +82,9 @@ impl AppState {
             launcher_focus_loss: Mutex::new(None),
             launcher_opened_at: Mutex::new(None),
             observed_window_app_instances: Mutex::new(HashSet::new()),
+            ui_heartbeats: Arc::new(Mutex::new(HashMap::new())),
+            monitored_webviews: Arc::new(Mutex::new(HashSet::new())),
+            ui_restart_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -147,13 +166,32 @@ impl AppState {
     }
 }
 
+pub fn run_session_host() -> anyhow::Result<()> {
+    let mut arguments = std::env::args_os().skip(1);
+    let mut config_dir = None;
+    while let Some(argument) = arguments.next() {
+        if argument == "--config-dir" {
+            config_dir = arguments.next().map(PathBuf::from);
+        }
+    }
+    let config_dir = config_dir.context("the session host requires --config-dir")?;
+    session_host::run(&config_dir)
+}
+
+pub fn run_ui_recovery_helper_if_requested() -> anyhow::Result<bool> {
+    watchdog::run_recovery_helper_if_requested()
+}
+
 const TERMINAL_WINDOW_PREFIX: &str = "terminal-";
 const ZENPLAN_WINDOW_PREFIX: &str = "zenplan-";
+const WEBVIEW_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+const WEBVIEW_WATCHDOG_GRACE: Duration = Duration::from_secs(15);
+const WEBVIEW_WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DockWindowToggleAction {
     Restore,
-    Minimize,
+    Hide,
     Focus,
     Show,
 }
@@ -166,7 +204,7 @@ fn dock_window_toggle_action(
     if is_minimized {
         DockWindowToggleAction::Restore
     } else if is_visible && was_focused_before_dock_click {
-        DockWindowToggleAction::Minimize
+        DockWindowToggleAction::Hide
     } else if is_visible {
         DockWindowToggleAction::Focus
     } else {
@@ -256,6 +294,9 @@ fn create_terminal_window(
         WebviewUrl::App("index.html".into()),
     )
     .title(format!("AI Dock — {}", definition.name))
+    // Keep local app windows in one WebView2 environment. Creating another
+    // environment while terminal events are flowing can re-enter Tauri's resource
+    // callback and deadlock its window-manager mutex.
     .inner_size(900.0, 620.0)
     .min_inner_size(420.0, 240.0)
     .decorations(false)
@@ -267,6 +308,18 @@ fn create_terminal_window(
     .build()
     .map_err(|error| error.to_string())?;
     windowing::disable_window_animations(&window).map_err(|error| format!("{error:#}"))?;
+    let shortcut_app = app.clone();
+    let restore_app = app.clone();
+    windowing::install_ctrl_h_handler(
+        &window,
+        move || {
+            let _ = emit_terminal_visibility(&shortcut_app, group_id, false);
+        },
+        move || {
+            let _ = emit_terminal_visibility(&restore_app, group_id, true);
+        },
+    )
+    .map_err(|error| format!("{error:#}"))?;
     Ok(window)
 }
 
@@ -304,6 +357,22 @@ fn create_zenplan_window(
     .build()
     .map_err(|error| error.to_string())?;
     windowing::disable_window_animations(&window).map_err(|error| format!("{error:#}"))?;
+    let shortcut_app = app.clone();
+    let shortcut_window = window.clone();
+    let notebook_id = notebook.id;
+    let restore_app = app.clone();
+    windowing::install_ctrl_h_handler(
+        &window,
+        move || {
+            let state = shortcut_app.state::<AppState>();
+            let _ = persist_zenplan_bounds(notebook_id, &shortcut_window, state.inner());
+            let _ = emit_zenplan_visibility(&shortcut_app, notebook_id, false);
+        },
+        move || {
+            let _ = emit_zenplan_visibility(&restore_app, notebook_id, true);
+        },
+    )
+    .map_err(|error| format!("{error:#}"))?;
     Ok(window)
 }
 
@@ -419,9 +488,9 @@ fn toggle_zenplan_inner(
             windowing::focus_window(&window).map_err(|error| format!("{error:#}"))?;
             emit_zenplan_visibility(app, notebook_id, true)
         }
-        DockWindowToggleAction::Minimize => {
+        DockWindowToggleAction::Hide => {
             persist_zenplan_bounds(notebook_id, &window, state)?;
-            window.minimize().map_err(|error| error.to_string())?;
+            window.hide().map_err(|error| error.to_string())?;
             emit_zenplan_visibility(app, notebook_id, false)
         }
         DockWindowToggleAction::Focus => {
@@ -783,8 +852,8 @@ async fn activate_group(
             windowing::focus_window(&terminal).map_err(|error| format!("{error:#}"))?;
             emit_terminal_visibility(&app, group_id, true)
         }
-        DockWindowToggleAction::Minimize => {
-            terminal.minimize().map_err(|error| error.to_string())?;
+        DockWindowToggleAction::Hide => {
+            terminal.hide().map_err(|error| error.to_string())?;
             emit_terminal_visibility(&app, group_id, false)
         }
         DockWindowToggleAction::Focus => {
@@ -806,6 +875,65 @@ async fn activate_group(
             emit_terminal_visibility(&app, group_id, true)
         }
     }
+}
+
+#[tauri::command]
+async fn toggle_all_terminals(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+    let (groups, popup_height) = {
+        let settings = state.settings.lock();
+        let mut seen = HashSet::new();
+        let groups = settings
+            .sessions
+            .iter()
+            .filter(|session| seen.insert(session.group_id))
+            .cloned()
+            .enumerate()
+            .map(|(slot, definition)| (definition.group_id, definition, slot))
+            .collect::<Vec<_>>();
+        (groups, settings.popup_height)
+    };
+
+    let any_visible = groups.iter().any(|(group_id, _, _)| {
+        app.get_webview_window(&terminal_window_label(*group_id))
+            .is_some_and(|window| {
+                window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
+            })
+    });
+    if any_visible {
+        hide_terminal(app, state, None)?;
+        return Ok(false);
+    }
+
+    let mut first_window = None;
+    for (group_id, definition, slot) in groups {
+        let (terminal, created) = match app.get_webview_window(&terminal_window_label(group_id)) {
+            Some(window) => (window, false),
+            None => (create_terminal_window(&app, group_id, &definition)?, true),
+        };
+        if terminal.is_minimized().map_err(|error| error.to_string())? {
+            terminal.unminimize().map_err(|error| error.to_string())?;
+        }
+        if created {
+            windowing::position_terminal(
+                &app,
+                &terminal,
+                definition.window_width,
+                definition.window_height.unwrap_or(popup_height),
+                definition.window_x.zip(definition.window_y),
+                slot,
+            )
+            .map_err(|error| format!("{error:#}"))?;
+        }
+        terminal.show().map_err(|error| error.to_string())?;
+        emit_terminal_visibility(&app, group_id, true)?;
+        if first_window.is_none() {
+            first_window = Some(terminal);
+        }
+    }
+    if let Some(terminal) = first_window {
+        windowing::focus_window(&terminal).map_err(|error| format!("{error:#}"))?;
+    }
+    Ok(true)
 }
 
 #[tauri::command]
@@ -1597,6 +1725,73 @@ fn save_terminal_bounds(
 }
 
 #[tauri::command]
+fn ui_heartbeat(window: WebviewWindow, state: State<'_, AppState>) {
+    state
+        .ui_heartbeats
+        .lock()
+        .insert(window.label().to_string(), Instant::now());
+}
+
+fn append_watchdog_log(path: &std::path::Path, message: &str) {
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(file, "{:?} {message}", SystemTime::now());
+}
+
+fn start_webview_heartbeat_watchdog(
+    heartbeats: Arc<Mutex<HashMap<String, Instant>>>,
+    monitored_webviews: Arc<Mutex<HashSet<String>>>,
+    restart_requested: Arc<AtomicBool>,
+    config_dir: PathBuf,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(&config_dir).context("creating WebView watchdog log directory")?;
+    let log_path = config_dir.join("watchdog.log");
+    thread::Builder::new()
+        .name("ai-dock-webview-watchdog".to_string())
+        .spawn(move || {
+            thread::sleep(WEBVIEW_WATCHDOG_GRACE);
+            loop {
+                thread::sleep(WEBVIEW_WATCHDOG_INTERVAL);
+
+                // Never call AppHandle::webview_windows from this thread. That API
+                // takes Tauri's window-manager lock, which is exactly the lock this
+                // watchdog must remain independent from when the UI is deadlocked.
+                let stale_label = {
+                    let monitored = monitored_webviews.lock();
+                    let recent = heartbeats.lock();
+                    monitored.iter().find_map(|label| {
+                        recent
+                            .get(label)
+                            .is_none_or(|seen| seen.elapsed() > WEBVIEW_HEARTBEAT_TIMEOUT)
+                            .then(|| label.clone())
+                    })
+                };
+
+                let Some(stale_label) = stale_label else {
+                    continue;
+                };
+                if restart_requested.swap(true, Ordering::SeqCst) {
+                    break;
+                }
+                let reason = format!(
+                    "WebView heartbeat stopped for {stale_label}; recovering UI without stopping detached sessions; pid={}",
+                    std::process::id()
+                );
+                if let Err(error) = watchdog::request_ui_recovery(&config_dir, &reason) {
+                    append_watchdog_log(
+                        &log_path,
+                        &format!("Could not start UI recovery helper: {error:#}"),
+                    );
+                    restart_requested.store(false, Ordering::SeqCst);
+                }
+            }
+        })
+        .context("starting WebView heartbeat watchdog")?;
+    Ok(())
+}
+
+#[tauri::command]
 fn exit_app(app: AppHandle, state: State<'_, AppState>) {
     state.restore_taskbar_if_needed();
     state.sessions.stop_all(&app);
@@ -1644,6 +1839,29 @@ pub fn run() {
             let dock = app
                 .get_webview_window("dock")
                 .context("dock window was not created")?;
+            let watchdog_config_dir = state
+                .settings_path
+                .parent()
+                .map_or_else(|| std::env::temp_dir().join("AiDock"), PathBuf::from);
+            state
+                .ui_heartbeats
+                .lock()
+                .insert(dock.label().to_string(), Instant::now());
+            state
+                .monitored_webviews
+                .lock()
+                .insert(dock.label().to_string());
+            // A WebView2 browser can briefly stop answering WM_NULL while xterm
+            // rebuilds a large retained scrollback buffer even though JavaScript
+            // and terminal input remain healthy. The page heartbeat is the reliable
+            // liveness signal; the native message-loop watchdog produced restart
+            // loops during normal session reattachment.
+            start_webview_heartbeat_watchdog(
+                state.ui_heartbeats.clone(),
+                state.monitored_webviews.clone(),
+                state.ui_restart_requested.clone(),
+                watchdog_config_dir,
+            )?;
             if is_test_build() && option_env!("AI_DOCK_TEST_APPBAR") != Some("1") {
                 dock.set_title("AI Dock Test")?;
                 dock.set_always_on_top(false)?;
@@ -1753,6 +1971,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            ui_heartbeat,
             get_settings,
             get_visible_groups,
             get_visible_zenplan_notebooks,
@@ -1775,6 +1994,7 @@ pub fn run() {
             is_windows_taskbar_visible,
             toggle_windows_taskbar,
             activate_group,
+            toggle_all_terminals,
             start_session,
             hide_terminal,
             close_terminal,
@@ -1817,7 +2037,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build AI Dock");
     application.run(|app, event| {
-        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+        if let tauri::RunEvent::ExitRequested { code, .. } = event {
             let state = app.state::<AppState>();
             let notebooks = state.settings.lock().zenplan_notebooks.clone();
             for notebook in notebooks {
@@ -1826,7 +2046,9 @@ pub fn run() {
                 }
             }
             state.restore_taskbar_if_needed();
-            state.sessions.stop_all(app);
+            if code != Some(tauri::RESTART_EXIT_CODE) {
+                state.sessions.stop_all(app);
+            }
         }
     });
 }
@@ -1843,7 +2065,7 @@ mod tests {
         );
         assert_eq!(
             dock_window_toggle_action(false, true, true),
-            DockWindowToggleAction::Minimize
+            DockWindowToggleAction::Hide
         );
         assert_eq!(
             dock_window_toggle_action(false, true, false),

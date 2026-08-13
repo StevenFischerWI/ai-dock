@@ -107,7 +107,7 @@ mod platform {
     const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_SHOWWINDOW: u32 = 0x0040;
     const SPI_SETWORKAREA: u32 = 0x002F;
-    const SPIF_SENDCHANGE: u32 = 0x0002;
+    const SPI_GETWORKAREA: u32 = 0x0030;
     const MONITORINFOF_PRIMARY: u32 = 1;
     const WM_DISPLAYCHANGE: u32 = 0x007E;
     const WM_ACTIVATE: u32 = 0x0006;
@@ -356,13 +356,22 @@ mod platform {
     }
 
     fn set_primary_work_area(mut work: Rect) -> Result<()> {
+        let mut current = Rect::default();
+        let read_current = unsafe {
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, (&raw mut current).cast::<c_void>(), 0)
+        };
+        if read_current != 0 && current == work {
+            return Ok(());
+        }
+
+        // Do not use SPIF_SENDCHANGE here. That flag synchronously broadcasts
+        // WM_SETTINGCHANGE from Tauri's single UI thread. A display/DPI change
+        // can re-enter one of our own window procedures (or encounter another
+        // hung desktop window) and freeze every AI Dock window indefinitely.
+        // SPI_SETWORKAREA updates Windows' work-area state before returning;
+        // Aero Snap and FancyZones read that state directly.
         let updated = unsafe {
-            SystemParametersInfoW(
-                SPI_SETWORKAREA,
-                0,
-                (&raw mut work).cast::<c_void>(),
-                SPIF_SENDCHANGE,
-            )
+            SystemParametersInfoW(SPI_SETWORKAREA, 0, (&raw mut work).cast::<c_void>(), 0)
         };
         if updated == 0 {
             return Err(anyhow!("SystemParametersInfoW(SPI_SETWORKAREA) failed"));

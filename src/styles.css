@@ -153,6 +153,64 @@ button:disabled {
   border-color: #2c3a51;
 }
 
+.terminal-visibility-button {
+  display: grid;
+  flex: 0 0 30px;
+  place-items: center;
+  width: 30px;
+  min-width: 30px;
+  padding: 0;
+  color: #8fa8c4;
+  background: #151c28;
+  border-color: #2b394c;
+}
+
+.terminal-visibility-button.is-active {
+  color: #dcecff;
+  background: #203149;
+  border-color: #5e8fbd;
+}
+
+.terminal-stack-glyph {
+  position: relative;
+  width: 17px;
+  height: 15px;
+}
+
+.terminal-stack-glyph::before {
+  content: '';
+  position: absolute;
+  top: 1px;
+  left: 4px;
+  width: 11px;
+  height: 8px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  box-shadow: -3px 3px 0 -1px #151c28, -3px 3px 0 0 currentColor;
+}
+
+.terminal-stack-glyph::after {
+  content: '+';
+  position: absolute;
+  right: -1px;
+  bottom: -3px;
+  width: 9px;
+  height: 9px;
+  color: #b8d7f6;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 8px;
+  text-align: center;
+  background: #151c28;
+  border-radius: 50%;
+}
+
+.terminal-visibility-button.is-active .terminal-stack-glyph::after {
+  content: '\2212';
+  color: #e6f2ff;
+  background: #203149;
+}
+
 .app-launcher-button {
   display: grid;
   flex: 0 0 30px;

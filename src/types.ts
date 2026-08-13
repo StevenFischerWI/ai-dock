@@ -83,8 +83,12 @@ export interface SessionStatePayload {
 }
 
 export interface TerminalOutputPayload {
+    sessionId: string;
+    data: string;
+}
+
+export interface TerminalActivityPayload {
   sessionId: string;
-  data: string;
 }
 
 export interface TerminalVisibilityPayload {

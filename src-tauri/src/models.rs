@@ -478,7 +478,7 @@ pub struct ZenPlanVisibilityPayload {
 #[serde(rename_all = "camelCase")]
 pub struct SessionStatePayload {
     pub session_id: Uuid,
-    pub state: &'static str,
+    pub state: String,
     pub exit_code: Option<u32>,
     pub message: Option<String>,
 }
@@ -488,6 +488,12 @@ pub struct SessionStatePayload {
 pub struct TerminalOutputPayload {
     pub session_id: Uuid,
     pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalActivityPayload {
+    pub session_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize)]

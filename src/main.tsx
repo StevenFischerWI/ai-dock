@@ -10,9 +10,19 @@ import { WindowAppsApp } from './WindowAppsApp';
 import { LauncherApp } from './LauncherApp';
 import { AppErrorBoundary } from './AppErrorBoundary';
 import { installGlobalErrorHandling } from './errorHandling';
+import { api } from './api';
 import './styles.css';
 
 installGlobalErrorHandling();
+
+// A dead WebView2 browser can leave its native window responsive even though the
+// page and terminal renderer are frozen. Keep a cheap page-level heartbeat so the
+// Rust shell can restart the UI while detached terminal sessions keep running.
+const sendHeartbeat = () => {
+  void api.uiHeartbeat().catch(() => undefined);
+};
+sendHeartbeat();
+window.setInterval(sendHeartbeat, 2_000);
 
 const label = getCurrentWindow().label;
 const Component = label.startsWith('terminal-')
