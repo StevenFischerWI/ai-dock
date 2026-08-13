@@ -1,5 +1,8 @@
 bin/
 obj/
+# bin/ above is a .NET build-output pattern and matches at any depth, which also
+# swallows Cargo's source directory for extra binaries. Keep that one tracked.
+!src-tauri/src/bin/
 node_modules/
 TestResults/
 *.user
