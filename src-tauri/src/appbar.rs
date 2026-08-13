@@ -4,7 +4,7 @@ mod platform {
         ffi::c_void,
         mem::size_of,
         sync::{
-            OnceLock,
+            Mutex, OnceLock,
             atomic::{AtomicBool, AtomicIsize, Ordering},
         },
     };
@@ -58,6 +58,7 @@ mod platform {
     unsafe extern "system" {
         fn GetDpiForWindow(hwnd: Hwnd) -> u32;
         fn GetMonitorInfoW(monitor: Hmonitor, info: *mut MonitorInfo) -> i32;
+        fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
         fn MonitorFromWindow(hwnd: Hwnd, flags: u32) -> Hmonitor;
         fn RegisterWindowMessageW(value: *const u16) -> u32;
         fn SetWindowPos(
@@ -119,6 +120,24 @@ mod platform {
     static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
     static PREVIOUS_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
     static WORK_AREA_OVERRIDDEN: AtomicBool = AtomicBool::new(false);
+    // Positioning the dock reenters itself: SetWindowPos raises WM_WINDOWPOSCHANGED,
+    // whose ABM_WINDOWPOSCHANGED makes Explorer answer with ABN_POSCHANGED, which
+    // positions again. Run the body once and let that fall through.
+    //
+    // The guard only catches reentry on one stack. ABN_POSCHANGED arrives posted, so
+    // the cycle also runs turn by turn through the message loop, where every pass sees
+    // a released guard. Nothing but leaving Explorer's state alone when it is already
+    // correct ends that, which is why the calls below are all conditional.
+    static POSITIONING: AtomicBool = AtomicBool::new(false);
+    // The appbar rectangle last handed to Explorer, so an unchanged position costs
+    // neither an ABM_SETPOS nor the ABN_POSCHANGED it would come back as.
+    static LAST_APPBAR_RECT: Mutex<Option<Rect>> = Mutex::new(None);
+    // Where the dock belongs depends on whether the taskbar is showing, and the two
+    // answers sit a dock height apart. Collapsing goes through ShowWindowAsync, so
+    // asking the window during the notification storm that same call provokes returns
+    // whichever answer it has reached, and the dock alternates between both
+    // placements. Track what was asked for and let that decide instead.
+    static TASKBAR_VISIBLE: AtomicBool = AtomicBool::new(true);
 
     pub struct AppBarManager {
         hwnd: Hwnd,
@@ -153,7 +172,10 @@ mod platform {
         }
 
         pub fn reposition(&self, taskbar_visible: bool) -> Result<()> {
-            position_raw(self.hwnd, self.height_dip, taskbar_visible)
+            // The caller just asked Windows for this state, so it outranks anything
+            // the taskbar window reports while that request is still landing.
+            TASKBAR_VISIBLE.store(taskbar_visible, Ordering::Release);
+            position_raw(self.hwnd, self.height_dip, taskbar_visible, true)
         }
 
         pub fn take_was_previous_foreground(&self, window: &WebviewWindow) -> Result<bool> {
@@ -193,10 +215,15 @@ mod platform {
             || message == WM_DISPLAYCHANGE
             || message == WM_DPICHANGED
         {
+            // A display or DPI change is real news about the geometry, so it may
+            // restate the work area. ABN_POSCHANGED is Explorer reporting its own
+            // recalculation, and answering that with a write is the loop itself.
+            let publish_work_area = message != APPBAR_CALLBACK;
             let _ = position_raw(
                 hwnd,
                 reference_data as f64,
-                crate::windows_taskbar::is_visible(),
+                TASKBAR_VISIBLE.load(Ordering::Acquire),
+                publish_work_area,
             );
         } else if message == WM_ACTIVATE {
             if (wparam & 0xffff) != 0 && lparam != 0 {
@@ -231,6 +258,9 @@ mod platform {
         unsafe {
             SHAppBarMessage(ABM_REMOVE, &mut stale);
         }
+        // Explorer no longer holds a position for this window, so the next pass has to
+        // publish one even if it matches what the previous registration used.
+        *LAST_APPBAR_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
         let mut data = appbar_data(hwnd);
         data.callback_message = APPBAR_CALLBACK;
@@ -238,10 +268,38 @@ mod platform {
         if result == 0 {
             return Err(anyhow!("SHAppBarMessage(ABM_NEW) failed"));
         }
-        position_raw(hwnd, height_dip, crate::windows_taskbar::is_visible())
+        // Registration and an Explorer restart are the moments the real taskbar state
+        // is settled and authoritative, so resynchronise the tracked intent here.
+        let visible = crate::windows_taskbar::is_visible();
+        TASKBAR_VISIBLE.store(visible, Ordering::Release);
+        position_raw(hwnd, height_dip, visible, true)
     }
 
-    fn position_raw(hwnd: Hwnd, height_dip: f64, taskbar_visible: bool) -> Result<()> {
+    /// `publish_work_area` marks the passes that may restate the work area.
+    ///
+    /// Explorer derives it from its own appbar table, so it overwrites anything we
+    /// publish that disagrees -- and the overwrite arrives as the notification that
+    /// would publish it again. Only a real state change gets to state a preference.
+    fn position_raw(
+        hwnd: Hwnd,
+        height_dip: f64,
+        taskbar_visible: bool,
+        publish_work_area: bool,
+    ) -> Result<()> {
+        if POSITIONING.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let result = position_locked(hwnd, height_dip, taskbar_visible, publish_work_area);
+        POSITIONING.store(false, Ordering::Release);
+        result
+    }
+
+    fn position_locked(
+        hwnd: Hwnd,
+        height_dip: f64,
+        taskbar_visible: bool,
+        publish_work_area: bool,
+    ) -> Result<()> {
         let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
         if monitor == 0 {
             return Err(anyhow!("MonitorFromWindow failed"));
@@ -266,8 +324,17 @@ mod platform {
             SHAppBarMessage(ABM_QUERYPOS, &mut data);
         }
         data.rect.top = data.rect.bottom - height;
-        unsafe {
-            SHAppBarMessage(ABM_SETPOS, &mut data);
+        // Explorer answers every ABM_SETPOS with an ABN_POSCHANGED, so republishing a
+        // rectangle it already holds keeps the cycle alive between message-loop turns.
+        // Only speak up when the approved position actually moved.
+        {
+            let mut last = LAST_APPBAR_RECT.lock().unwrap_or_else(|e| e.into_inner());
+            if *last != Some(data.rect) {
+                unsafe {
+                    SHAppBarMessage(ABM_SETPOS, &mut data);
+                }
+                *last = Some(data.rect);
+            }
         }
 
         let window_rect = if taskbar_visible {
@@ -280,22 +347,45 @@ mod platform {
                 bottom: monitor_info.monitor.bottom,
             }
         };
-        let positioned = unsafe {
-            SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                window_rect.left,
-                window_rect.top,
-                window_rect.right - window_rect.left,
-                window_rect.bottom - window_rect.top,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )
-        };
-        if positioned == 0 {
-            return Err(anyhow!("SetWindowPos failed"));
+        // Moving the window raises WM_WINDOWPOSCHANGED, which reports to Explorer and
+        // earns another ABN_POSCHANGED. Doing that unconditionally meant any nudge --
+        // minimizing an unrelated window is enough, by way of WM_ACTIVATE -- started a
+        // reposition that kept feeding itself. Touch the window only to change it.
+        if window_rect != current_window_rect(hwnd) {
+            let positioned = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    window_rect.left,
+                    window_rect.top,
+                    window_rect.right - window_rect.left,
+                    window_rect.bottom - window_rect.top,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )
+            };
+            if positioned == 0 {
+                return Err(anyhow!("SetWindowPos failed"));
+            }
         }
-        reserve_primary_work_area(&monitor_info, window_rect)?;
+        if publish_work_area {
+            reserve_primary_work_area(&monitor_info, window_rect)?;
+        }
         Ok(())
+    }
+
+    /// The window's present screen rectangle, or a sentinel that compares unequal to
+    /// any real position so a failed read still lets the move through.
+    fn current_window_rect(hwnd: Hwnd) -> Rect {
+        let mut rect = Rect::default();
+        if unsafe { GetWindowRect(hwnd, &raw mut rect) } == 0 {
+            return Rect {
+                left: i32::MIN,
+                top: i32::MIN,
+                right: i32::MIN,
+                bottom: i32::MIN,
+            };
+        }
+        rect
     }
 
     fn reserve_primary_work_area(monitor_info: &MonitorInfo, dock_rect: Rect) -> Result<()> {
@@ -309,10 +399,31 @@ mod platform {
         // that state GetMonitorInfo still reports the full monitor as usable and
         // Aero Snap/FancyZones place windows behind the dock. Publish the dock's
         // real top edge as the primary work-area bottom as a guarded fallback.
-        let work = dock_work_area(monitor_info.work, monitor_info.monitor, dock_rect);
+        let work = dock_work_area(pristine_work_area(monitor_info), monitor_info.monitor, dock_rect);
         set_primary_work_area(work)?;
         WORK_AREA_OVERRIDDEN.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// The work area as Windows would report it without our own override.
+    ///
+    /// GetMonitorInfo returns whatever was last published, so once an override is in
+    /// effect its result is our previous output. Feeding that back in walks the
+    /// reservation up the screen a little further on every pass, so reconstruct the
+    /// untouched work area from the monitor and the real taskbar instead.
+    fn pristine_work_area(monitor_info: &MonitorInfo) -> Rect {
+        if !WORK_AREA_OVERRIDDEN.load(Ordering::Acquire) {
+            return monitor_info.work;
+        }
+
+        let mut work = monitor_info.monitor;
+        if TASKBAR_VISIBLE.load(Ordering::Acquire) {
+            let mut taskbar = appbar_data(0);
+            if unsafe { SHAppBarMessage(ABM_GETTASKBARPOS, &mut taskbar) } != 0 {
+                work = work_area_with_appbar(work, taskbar.edge, taskbar.rect);
+            }
+        }
+        work
     }
 
     fn restore_primary_work_area(hwnd: Hwnd) -> Result<()> {
@@ -463,6 +574,35 @@ mod platform {
                     ..monitor
                 }
             );
+        }
+
+        #[test]
+        fn recomputing_from_the_pristine_rect_does_not_walk_the_reservation_upward() {
+            let monitor = Rect {
+                left: 0,
+                top: 0,
+                right: 3440,
+                bottom: 1440,
+            };
+            // Monitor minus the real taskbar: what pristine_work_area rebuilds.
+            let pristine = Rect {
+                bottom: 1392,
+                ..monitor
+            };
+            let dock = Rect {
+                top: 1400,
+                ..monitor
+            };
+
+            let first = dock_work_area(pristine, monitor, dock);
+            assert_eq!(first.bottom, 1400);
+            // Every later pass starts from the same pristine rectangle, so the
+            // reservation settles instead of climbing by a dock height each time.
+            assert_eq!(dock_work_area(pristine, monitor, dock), first);
+
+            // Feeding a prior override back in is what used to drift: the clamp floor
+            // rises with it, so the reservation could never come back down.
+            assert_eq!(dock_work_area(first, monitor, dock).bottom, first.bottom);
         }
 
         #[test]
