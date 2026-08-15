@@ -175,7 +175,7 @@ mod platform {
             // The caller just asked Windows for this state, so it outranks anything
             // the taskbar window reports while that request is still landing.
             TASKBAR_VISIBLE.store(taskbar_visible, Ordering::Release);
-            position_raw(self.hwnd, self.height_dip, taskbar_visible, true)
+            position_raw(self.hwnd, self.height_dip, taskbar_visible)
         }
 
         pub fn take_was_previous_foreground(&self, window: &WebviewWindow) -> Result<bool> {
@@ -215,15 +215,10 @@ mod platform {
             || message == WM_DISPLAYCHANGE
             || message == WM_DPICHANGED
         {
-            // A display or DPI change is real news about the geometry, so it may
-            // restate the work area. ABN_POSCHANGED is Explorer reporting its own
-            // recalculation, and answering that with a write is the loop itself.
-            let publish_work_area = message != APPBAR_CALLBACK;
             let _ = position_raw(
                 hwnd,
                 reference_data as f64,
                 TASKBAR_VISIBLE.load(Ordering::Acquire),
-                publish_work_area,
             );
         } else if message == WM_ACTIVATE {
             if (wparam & 0xffff) != 0 && lparam != 0 {
@@ -272,34 +267,19 @@ mod platform {
         // is settled and authoritative, so resynchronise the tracked intent here.
         let visible = crate::windows_taskbar::is_visible();
         TASKBAR_VISIBLE.store(visible, Ordering::Release);
-        position_raw(hwnd, height_dip, visible, true)
+        position_raw(hwnd, height_dip, visible)
     }
 
-    /// `publish_work_area` marks the passes that may restate the work area.
-    ///
-    /// Explorer derives it from its own appbar table, so it overwrites anything we
-    /// publish that disagrees -- and the overwrite arrives as the notification that
-    /// would publish it again. Only a real state change gets to state a preference.
-    fn position_raw(
-        hwnd: Hwnd,
-        height_dip: f64,
-        taskbar_visible: bool,
-        publish_work_area: bool,
-    ) -> Result<()> {
+    fn position_raw(hwnd: Hwnd, height_dip: f64, taskbar_visible: bool) -> Result<()> {
         if POSITIONING.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let result = position_locked(hwnd, height_dip, taskbar_visible, publish_work_area);
+        let result = position_locked(hwnd, height_dip, taskbar_visible);
         POSITIONING.store(false, Ordering::Release);
         result
     }
 
-    fn position_locked(
-        hwnd: Hwnd,
-        height_dip: f64,
-        taskbar_visible: bool,
-        publish_work_area: bool,
-    ) -> Result<()> {
+    fn position_locked(hwnd: Hwnd, height_dip: f64, taskbar_visible: bool) -> Result<()> {
         let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
         if monitor == 0 {
             return Err(anyhow!("MonitorFromWindow failed"));
@@ -324,18 +304,6 @@ mod platform {
             SHAppBarMessage(ABM_QUERYPOS, &mut data);
         }
         data.rect.top = data.rect.bottom - height;
-        // Explorer answers every ABM_SETPOS with an ABN_POSCHANGED, so republishing a
-        // rectangle it already holds keeps the cycle alive between message-loop turns.
-        // Only speak up when the approved position actually moved.
-        {
-            let mut last = LAST_APPBAR_RECT.lock().unwrap_or_else(|e| e.into_inner());
-            if *last != Some(data.rect) {
-                unsafe {
-                    SHAppBarMessage(ABM_SETPOS, &mut data);
-                }
-                *last = Some(data.rect);
-            }
-        }
 
         let window_rect = if taskbar_visible {
             data.rect
@@ -347,6 +315,27 @@ mod platform {
                 bottom: monitor_info.monitor.bottom,
             }
         };
+
+        // Register the rectangle the dock actually occupies rather than the one
+        // ABM_QUERYPOS approved. With the taskbar collapsed those differ, because
+        // Explorer keeps the hidden taskbar's reservation and answers as though the
+        // dock still had to sit above it. Publishing the real position lets Explorer
+        // derive a work area that describes the layout on screen, so there is nothing
+        // left for us to contradict -- and contradicting it never held anyway, since
+        // Explorer recomputes from that table and overwrites whatever we set.
+        data.rect = window_rect;
+        // Explorer answers every ABM_SETPOS with an ABN_POSCHANGED, so republishing a
+        // rectangle it already holds keeps the cycle alive between message-loop turns.
+        // Only speak up when the position actually moved.
+        {
+            let mut last = LAST_APPBAR_RECT.lock().unwrap_or_else(|e| e.into_inner());
+            if *last != Some(data.rect) {
+                unsafe {
+                    SHAppBarMessage(ABM_SETPOS, &mut data);
+                }
+                *last = Some(data.rect);
+            }
+        }
         // Moving the window raises WM_WINDOWPOSCHANGED, which reports to Explorer and
         // earns another ABN_POSCHANGED. Doing that unconditionally meant any nudge --
         // minimizing an unrelated window is enough, by way of WM_ACTIVATE -- started a
@@ -367,9 +356,6 @@ mod platform {
                 return Err(anyhow!("SetWindowPos failed"));
             }
         }
-        if publish_work_area {
-            reserve_primary_work_area(&monitor_info, window_rect)?;
-        }
         Ok(())
     }
 
@@ -388,44 +374,12 @@ mod platform {
         rect
     }
 
-    fn reserve_primary_work_area(monitor_info: &MonitorInfo, dock_rect: Rect) -> Result<()> {
-        if monitor_info.flags & MONITORINFOF_PRIMARY == 0 {
-            return Ok(());
-        }
-
-        // Explorer keeps the hidden taskbar registered on the bottom AppBar edge.
-        // Windows therefore approves AI Dock above that invisible rectangle even
-        // though we deliberately draw the dock at the physical bottom edge. In
-        // that state GetMonitorInfo still reports the full monitor as usable and
-        // Aero Snap/FancyZones place windows behind the dock. Publish the dock's
-        // real top edge as the primary work-area bottom as a guarded fallback.
-        let work = dock_work_area(pristine_work_area(monitor_info), monitor_info.monitor, dock_rect);
-        set_primary_work_area(work)?;
-        WORK_AREA_OVERRIDDEN.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    /// The work area as Windows would report it without our own override.
+    /// Puts back a work area published by an older build of this app.
     ///
-    /// GetMonitorInfo returns whatever was last published, so once an override is in
-    /// effect its result is our previous output. Feeding that back in walks the
-    /// reservation up the screen a little further on every pass, so reconstruct the
-    /// untouched work area from the monitor and the real taskbar instead.
-    fn pristine_work_area(monitor_info: &MonitorInfo) -> Rect {
-        if !WORK_AREA_OVERRIDDEN.load(Ordering::Acquire) {
-            return monitor_info.work;
-        }
-
-        let mut work = monitor_info.monitor;
-        if TASKBAR_VISIBLE.load(Ordering::Acquire) {
-            let mut taskbar = appbar_data(0);
-            if unsafe { SHAppBarMessage(ABM_GETTASKBARPOS, &mut taskbar) } != 0 {
-                work = work_area_with_appbar(work, taskbar.edge, taskbar.rect);
-            }
-        }
-        work
-    }
-
+    /// Nothing sets that override any more -- the AppBar registration alone tells
+    /// Explorer where the dock is, and a value it disagrees with never survived its
+    /// next recalculation anyway. This remains so an upgrade over a version that did
+    /// leave one behind still hands the desktop back intact.
     fn restore_primary_work_area(hwnd: Hwnd) -> Result<()> {
         if !WORK_AREA_OVERRIDDEN.swap(false, Ordering::AcqRel) {
             return Ok(());
@@ -490,15 +444,6 @@ mod platform {
         Ok(())
     }
 
-    fn dock_work_area(current: Rect, monitor: Rect, dock: Rect) -> Rect {
-        Rect {
-            left: current.left.max(monitor.left),
-            top: current.top.max(monitor.top),
-            right: current.right.min(monitor.right),
-            bottom: dock.top.clamp(current.top.max(monitor.top), monitor.bottom),
-        }
-    }
-
     fn work_area_with_appbar(mut work: Rect, edge: u32, appbar: Rect) -> Rect {
         match edge {
             ABE_LEFT => work.left = work.left.max(appbar.right),
@@ -533,77 +478,6 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
-
-        #[test]
-        fn dock_work_area_tracks_the_docks_real_top_edge() {
-            let monitor = Rect {
-                left: 0,
-                top: 0,
-                right: 3440,
-                bottom: 1440,
-            };
-
-            assert_eq!(
-                dock_work_area(
-                    monitor,
-                    monitor,
-                    Rect {
-                        top: 1400,
-                        ..monitor
-                    }
-                ),
-                Rect {
-                    bottom: 1400,
-                    ..monitor
-                }
-            );
-            assert_eq!(
-                dock_work_area(
-                    Rect {
-                        bottom: 1400,
-                        ..monitor
-                    },
-                    monitor,
-                    Rect {
-                        top: 1408,
-                        ..monitor
-                    },
-                ),
-                Rect {
-                    bottom: 1408,
-                    ..monitor
-                }
-            );
-        }
-
-        #[test]
-        fn recomputing_from_the_pristine_rect_does_not_walk_the_reservation_upward() {
-            let monitor = Rect {
-                left: 0,
-                top: 0,
-                right: 3440,
-                bottom: 1440,
-            };
-            // Monitor minus the real taskbar: what pristine_work_area rebuilds.
-            let pristine = Rect {
-                bottom: 1392,
-                ..monitor
-            };
-            let dock = Rect {
-                top: 1400,
-                ..monitor
-            };
-
-            let first = dock_work_area(pristine, monitor, dock);
-            assert_eq!(first.bottom, 1400);
-            // Every later pass starts from the same pristine rectangle, so the
-            // reservation settles instead of climbing by a dock height each time.
-            assert_eq!(dock_work_area(pristine, monitor, dock), first);
-
-            // Feeding a prior override back in is what used to drift: the clamp floor
-            // rises with it, so the reservation could never come back down.
-            assert_eq!(dock_work_area(first, monitor, dock).bottom, first.bottom);
-        }
 
         #[test]
         fn restoring_work_area_accounts_for_a_bottom_taskbar() {
